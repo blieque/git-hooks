@@ -1,0 +1,109 @@
+#!/bin/bash
+
+# This script checks out a branch from a bare Git repository, checks that the
+# branch is the correct one, runs some build steps, and deploys (after making a
+# copy of the current deployment).
+#
+# The script also includes a little performance perk for development with NPM.
+# Before checking out, the script will move `node_modules/' to `/tmp' and move
+# it back in afterwards. This saves NPM having to potentially download and
+# unpackage all the dependencies again. Changes to a apps dependencies will
+# still work just fine; NPM is still called.
+#
+# Usage:
+#   post-receive -f [<branch>]      Force build (avoids branch name check from
+#                                   `stdin'). `branch' defaults to "master".
+
+# Required for setting constants.
+function normalise-path {
+    # Resolves a path, e.g., "/usr/../lib" => "/lib"
+    echo "$(cd $1 && pwd)"
+}
+
+# CONSTANTS
+# Note: $PWD is the bare repository directory when Git calls the script.
+
+# Directory for the app, likely containing repo, server-side, public, etc.
+APP_DIR="$(normalise-path $PWD/..)"
+# Directory to checkout the repo to.
+CHECKOUT_DIR="$APP_DIR"/project.build
+# Directory of build output.
+BUILD_OUTPUT_DIR="$APP_DIR"/project.build/dist
+# Directory for build output, likely the public document root.
+LIVE_DIR="$APP_DIR"/public
+# Directory for the last build output, used to backup before deployment.
+LIVE_LAST_DIR="$APP_DIR"/public-last
+# Empty string for any branch.
+BRANCH="master"
+
+# FUNCTIONS
+
+function notice {
+    # Echoes a message in one of the basic 16 terminal colours.
+    echo -e "\e[3$1m$2\e[0m"
+}
+
+function build {
+    branch="$1"
+    [[ "$branch" == "" ]] && branch="master"
+    notice 2 "Deploying branch \"$branch\"."
+
+    # Move `node_modules/' out of the way if there's a previous check out.
+    if [[ -d "$CHECKOUT_DIR" ]]; then
+        notice 4 "Moving exisiting \`node_modules' for re-use."
+        temp_node_modules="$APP_DIR"/node_modules_"$(date +'%s')"
+        mv "$CHECKOUT_DIR"/node_modules "$temp_node_modules"
+        rm -rf "$CHECKOUT_DIR"
+    fi
+
+    # Check out the repository.
+    notice 4 "Checking out new source from Git."
+    # `git checkout' is preferable in newer versions of git, but this works.
+    git clone -b $branch --depth=1 "file://$PWD" "$CHECKOUT_DIR"
+
+    # Move `node_modules' back into place.
+    if [[ -d "$temp_node_modules" ]]; then
+        notice 4 "Placing backed-up \`node_modules' back in source directory."
+        mv "$temp_node_modules" "$CHECKOUT_DIR"/node_modules
+    fi
+
+    # Build.
+    notice 4 "Building..."
+    cd "$CHECKOUT_DIR"
+    npm install
+    gulp build
+
+    # Delete last build's backup.
+    if [[ -e "$LIVE_LAST_DIR" ]]; then
+        notice 4 "Removing old auto-backup."
+        rm -rf "$LIVE_LAST_DIR"
+    fi
+
+    # Move current production to backup.
+    if [[ -d "$LIVE_DIR" ]]; then
+        notice 4 "Moving current live site to auto-backup."
+        mv "$LIVE_DIR" "$LIVE_LAST_DIR"
+    fi
+
+    # Deploy.
+    notice 4 "Making new build live."
+    mv "$BUILD_OUTPUT_DIR" "$LIVE_DIR"
+
+    # Provide one-line command to quickly revert build.
+    echo "If this push was mistaken log in and run:"
+    echo "  rm -rf $LIVE_DIR && mv $LIVE_LAST_DIR $LIVE_DIR"
+}
+
+# GO TIME
+
+if [[ "$1" == "-f"  ]]; then
+    build $2
+else
+    while read gitoldrev gitnewrev gitbranch
+    do
+        if [[ "$BRANCH" == "" ]] || [[ "$gitbranch" == "refs/heads/$BRANCH" ]]; then
+            gitbranch_parts=(${gitbranch//\// })
+            build ${gitbranch_parts[2]}
+        fi
+    done
+fi
